@@ -1,0 +1,130 @@
+---
+title: "18 Clustering based on density: DBSCAN and OPTICS"
+author: "ari"
+date: "9 3 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 18.2.2. Tuning the epsilon and minPts hyperparameters 
+```{r}
+library(tidyverse)
+
+data(banknote, package = "mclust")
+
+swissTib <- select(banknote, -Status) %>%
+  as_tibble()
+
+swissTib
+
+swissScaled <- swissTib %>% scale()
+```
+
+```{r message=FALSE, warning=FALSE}
+library(GGally)
+
+ggpairs(swissTib, upper = list(continuous = "density")) +
+  theme_bw()
+```
+This consists of calculating the distance from each point to its kth-nearest neighbor and then ordering the points in a plot based on this distance. In data with regions of high and low density, this tends to produce a plot containing a “knee” or “elbow” (depending on your preference). The optimal value of epsilon is in or near that knee/elbow. Because a core point in DBSCAN has minPts cases inside its epsilon, choosing a value of epsilon at the knee of this plot means choosing a search distance that will result in cases in high-density regions being considered core points. We can create this plot using the kNNdistplot() function from the dbscan package. 
+
+```{r Plotting the kNN distance plot}
+library(dbscan)
+#install.packages("dbscan")
+
+kNNdistplot(swissScaled, k = 5)
+
+abline(h = c(1.2, 2.0))
+```
+
+We need to use the k argument to specify the number of nearest neighbors we want to calculate the distance to. But we don’t yet know what our minPts argument should be, so how can we set k? I usually pick a sensible value that I believe is approximately correct (remember that minPts defines the minimum cluster size): here, I’ve selected 5. The position of the knee in the plot is relatively robust to changes in k. 
+
+```{r}
+dbsParamSpace <- expand.grid(eps = seq(1.2, 2.0, 0.1),
+                             minPts = seq(1, 9, 1))
+```
+
+Now that we’ve defined our hyperparameter search space, let’s run the DBSCAN algorithm on each distinct combination of epsilon and minPts. To do this, we use the pmap() function from the purrr package to apply the dbscan() function to each row of the dbsParamSpace object. 
+
+```{r}
+swissDbs <- pmap(dbsParamSpace, dbscan, x = swissScaled)
+
+
+swissDbs[[8]]$cluster
+```
+
+```{r}
+clusterResults <- map_dfc(swissDbs, ~.$cluster)
+
+clusterResults
+```
+
+```{r}
+swissClusters <- bind_cols(swissTib, clusterResults)
+
+swissClusters
+```
+
+```{r}
+swissClustersGathered <- gather(swissClusters,
+                                key = "Permutation", value = "Cluster",
+                                -Length, -Left, -Right,
+                                -Bottom, -Top, -Diagonal)
+unique(swissClustersGathered$Permutation)
+```
+Great—now our tibble is in a format ready for plotting. Looking back at figure 18.8, we can see that the variables that most obviously separate clusters in the data are Right and Diagonal. As such, we’ll plot these variables against each other by mapping them to the x and y aesthetics, respectively. We map the Cluster variable to the color aesthetic (wrapping it inside as.factor() so the colors aren’t drawn as a single gradient). We then facet by Permutation, add a geom_point() layer, and add a theme. Because some of the cluster models have a large number of clusters, we suppress the drawing of what would be a very large legend, by adding the line theme(legend.position = "none"). 
+
+```{r}
+swissClustersGathered %>% mutate(#Permutation = str_replace_all(Permutation,c(".."="")),
+                                 Permutation = str_replace_all(Permutation,c("..."=""))) %>%
+  filter(Permutation %in% as.character(c(1:30))) %>%
+ggplot( aes(Right, Diagonal,
+                                  col = as.factor(Cluster))) +
+  facet_wrap(~ Permutation) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+In chapter 17, we defined our own function that would take the data and the cluster membership from a clustering model and calculate the Davies-Bouldin and Dunn indices and the pseudo F statistic. Let’s redefine this function to refresh your memory
+
+```{r}
+cluster_metrics <- function(data, clusters, dist_matrix) {
+  list(db   = clusterSim::index.DB(data, clusters)$DB,
+       G1   = clusterSim::index.G1(data, clusters),
+       dunn = clValid::dunn(dist_matrix, clusters),
+       clusters = length(unique(clusters))
+  )
+}
+```
+
+```{r}
+swissBoot <- map(1:10, ~ {
+  swissScaled %>%
+    as_tibble() %>%
+    sample_n(size = nrow(.), replace = TRUE)
+})
+```
+
+```{r}
+
+
+metricsTib <- map_df(swissBoot, function(boot) {
+  clusterResult <- pmap(dbsParamSpace, dbscan, x = boot)
+
+  map_df(clusterResult, function(permutation) {
+    clust <- as_tibble(permutation$cluster)
+    filteredData <- bind_cols(boot, clust) %>%
+      filter(value != 0)
+
+    d <- dist(select(filteredData, -value))
+
+    cluster_metrics(select(filteredData, -value),
+                    clusters = filteredData$value,
+                    dist_matrix = d)
+  })
+})
+```
+
